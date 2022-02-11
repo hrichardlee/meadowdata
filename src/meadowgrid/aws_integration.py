@@ -2,11 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import datetime
 import json
+import threading
 import traceback
 from types import TracebackType
-from typing import Optional, Any, Callable, TypeVar, Tuple, Type, Generator, Iterable
+from typing import (
+    Optional,
+    Any,
+    Callable,
+    TypeVar,
+    Tuple,
+    Type,
+    Generator,
+    Iterable,
+    Sequence, Dict,
+)
 
 import aiohttp
 import aiohttp.client_exceptions
@@ -15,16 +27,22 @@ import botocore.client
 import botocore.exceptions
 import pandas as pd
 
-from meadowgrid.agent_creator import AgentCreator, OnDemandOrSpotType
+from meadowgrid.agent_creator import (
+    AgentCreator,
+    OnDemandOrSpotType,
+    choose_instance_types_for_job,
+)
 from meadowgrid.config import DEFAULT_COORDINATOR_PORT, EC2_PRICES_UPDATE_SECS
 from meadowgrid.coordinator_client import MeadowGridCoordinatorClientAsync
-
+from meadowgrid.resource_allocation import Resources
 
 _MEADOWGRID_COORDINATOR_ROLE = "meadowgridCoordinatorRole"
 _MEADOWGRID_COORDINATOR_SECURITY_GROUP = "meadowgridCoordinatorSecurityGroup"
 _MEADOWGRID_AGENT_SECURITY_GROUP = "meadowgridAgentSecurityGroup"
+_MEADOWGRID_SSH_SECURITY_GROUP = "meadowgridSshSecurityGroup"
 _COORDINATOR_AWS_AMI = "ami-0e2b160b07bab8a4b"
 _AGENT_AWS_AMI = "ami-00fefcea9b035e2d6"
+_MEADOWGRID_AWS_AMI = "ami-0dea38efe08f8a249"
 
 
 _T = TypeVar("_T")
@@ -85,9 +103,10 @@ async def _get_default_region_name() -> str:
     are running on an EC2 instance in which case we check the AWS metadata endpoint
     """
 
-    if boto3.DEFAULT_SESSION is not None:
+    default_session = boto3._get_default_session()
+    if default_session is not None:
         # equivalent of `aws configure get region`
-        return boto3.DEFAULT_SESSION.region_name
+        return default_session.region_name
     else:
         result = await _get_ec2_metadata("placement/region")
         if result:
@@ -196,6 +215,243 @@ async def _get_current_ip_for_ssh() -> str:
         return (await response.text()).strip()
 
 
+async def ensure_meadowgrid_ssh_security_group() -> str:
+    current_ip_for_ssh = await _get_current_ip_for_ssh()
+    return ensure_security_group(
+        _MEADOWGRID_SSH_SECURITY_GROUP, [(22, 22, f"{current_ip_for_ssh}/32")], []
+    )
+
+
+def ensure_security_group(
+    group_name: str,
+    open_port_ip: Sequence[Tuple[int, int, str]],
+    open_port_group: Sequence[Tuple[int, int, str]],
+) -> str:
+    ec2_resource = boto3.resource("ec2")
+    security_group = _get_ec2_security_group(ec2_resource, group_name)
+    if security_group is None:
+        security_group = ec2_resource.create_security_group(
+            Description=group_name, GroupName=group_name
+        )
+
+    for from_port, to_port, cidr_ip in open_port_ip:
+        _ignore_boto3_error_code(
+            lambda: security_group.authorize_ingress(
+                IpProtocol="tcp",
+                CidrIp=cidr_ip,
+                FromPort=from_port,
+                ToPort=to_port,
+            ),
+            "InvalidPermission.Duplicate",
+        )
+
+    for from_port, to_port, group_id in open_port_group:
+        _ignore_boto3_error_code(
+            lambda: security_group.authorize_ingress(
+                IpPermissions=[
+                    {
+                        "FromPort": from_port,
+                        "ToPort": to_port,
+                        "IpProtocol": "tcp",
+                        "UserIdGroupPairs": [{"GroupId": group_id}],
+                    }
+                ]
+            ),
+            "InvalidPermission.Duplicate",
+        )
+
+    return security_group.id
+
+
+async def launch_ec2_instance(
+    region_name: str,
+    instance_type: str,
+    on_demand_or_spot: OnDemandOrSpotType,
+    ami_id: str,
+    security_group_ids: Optional[Sequence[str]] = None,
+    iam_role_name: Optional[str] = None,
+    user_data: Optional[str] = None,
+    key_name: Optional[str] = None,
+    wait_for_dns_name: bool = True,
+) -> Optional[str]:
+    """
+    Launches the specified EC2 instances, waits for it to be running, then returns its
+    public dns name
+    """
+
+    optional_args: Dict[str, Any] = {}
+    if security_group_ids:
+        optional_args["SecurityGroupIds"] = security_group_ids
+    if iam_role_name:
+        optional_args["IamInstanceProfile"] = {"Name": iam_role_name}
+    if key_name:
+        optional_args["KeyName"] = key_name
+
+    if on_demand_or_spot == "on_demand":
+        if user_data:
+            optional_args["UserData"] = user_data
+
+        ec2_resource = boto3.resource("ec2", region_name=region_name)
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.run_instances
+        instance = ec2_resource.create_instances(
+            ImageId=ami_id,
+            MinCount=1,
+            MaxCount=1,
+            InstanceType=instance_type,
+            **optional_args,
+        )[0]
+
+        if wait_for_dns_name:
+            # this should work? https://boto3.amazonaws.com/v1/documentation/api/latest/guide/clients.html#multithreading-or-multiprocessing-with-clients
+            instance_running_future: asyncio.Future = asyncio.Future()
+            event_loop = asyncio.get_running_loop()
+
+            def wait_until_running() -> None:
+                instance.wait_until_running()
+                event_loop.call_soon_threadsafe(
+                    lambda: instance_running_future.set_result(None)
+                )
+
+            threading.Thread(target=wait_until_running).start()
+            await instance_running_future
+
+            instance.load()
+            if not instance.public_dns_name:
+                raise ValueError("Waited until running, but still no IP address!")
+            return instance.public_dns_name
+        else:
+            return None
+    elif on_demand_or_spot == "spot":
+        if user_data:
+            optional_args["UserData"] = base64.b64encode(
+                user_data.encode("utf-8")
+            ).decode("utf-8")
+
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.request_spot_instances
+        client = boto3.client("ec2", region_name=region_name)
+        spot_instance_request = client.request_spot_instances(
+            InstanceCount=1,
+            LaunchSpecification={
+                "ImageId": ami_id,
+                "InstanceType": instance_type,
+                **optional_args,
+            },
+        )
+
+        if wait_for_dns_name:
+            spot_instance_request_id = spot_instance_request["SpotInstanceRequests"][0][
+                "SpotInstanceRequestId"
+            ]
+
+            instance_running_future = asyncio.Future()
+            event_loop = asyncio.get_running_loop()
+            waiter = client.get_waiter("spot_instance_request_fulfilled")
+
+            def wait_until_running() -> None:
+                waiter.wait(SpotInstanceRequestIds=[spot_instance_request_id])
+                event_loop.call_soon_threadsafe(
+                    lambda: instance_running_future.set_result(None)
+                )
+
+            threading.Thread(target=wait_until_running).start()
+            await instance_running_future
+
+            instance_id = client.describe_spot_instance_requests(
+                SpotInstanceRequestIds=[spot_instance_request_id]
+            )["SpotInstanceRequests"][0]["InstanceId"]
+            return client.describe_instances(InstanceIds=[instance_id])["Reservations"][
+                0
+            ]["Instances"][0]["PublicDnsName"]
+        else:
+            return None
+    else:
+        raise ValueError(f"Unexpected value for on_demand_or_spot {on_demand_or_spot}")
+
+
+@dataclasses.dataclass(frozen=True)
+class EC2Host:
+    public_dns_name: str
+    memory_gb: float
+    logical_cpus: int
+    interruption_probability: float
+
+
+async def launch_ec2_instances(
+    logical_cpu_required: float,
+    memory_gb_required: float,
+    num_tasks: int,
+    interruption_probability_threshold: float,
+    ami_id: str,
+    region_name: Optional[str] = None,
+    security_group_ids: Optional[Sequence[str]] = None,
+    iam_role_name: Optional[str] = None,
+    user_data: Optional[str] = None,
+    key_name: Optional[str] = None,
+    wait_for_dns_name: bool = True,
+) -> Sequence[EC2Host]:
+    if region_name is None:
+        region_name = await _get_default_region_name()
+
+    chosen_instance_types = choose_instance_types_for_job(
+        Resources(memory_gb_required, logical_cpu_required, {}),
+        num_tasks,
+        interruption_probability_threshold,
+        await _get_ec2_instance_types(region_name),
+    )
+    if len(chosen_instance_types) < 1:
+        raise ValueError(
+            f"There were no instance types that could be selected for "
+            f"memory={memory_gb_required}, cpu={logical_cpu_required}"
+        )
+
+    public_dns_name_tasks = []
+    host_metadatas = []
+
+    for (
+        instance_type,
+        on_demand_or_spot,
+        num_instances,
+        memory_gb,
+        logical_cpu,
+        interruption_probability,
+    ) in chosen_instance_types[
+        [
+            "instance_type",
+            "on_demand_or_spot",
+            "num_instances",
+            "memory_gb",
+            "logical_cpu",
+            "interruption_probability",
+        ]
+    ].itertuples(
+        index=False
+    ):
+
+        for _ in range(num_instances):
+            # should really launch these with a single API call
+            public_dns_name_tasks.append(
+                launch_ec2_instance(
+                    region_name,
+                    instance_type,
+                    on_demand_or_spot,
+                    ami_id=ami_id,
+                    security_group_ids=security_group_ids,
+                    iam_role_name=iam_role_name,
+                    user_data=user_data,
+                    key_name=key_name,
+                    wait_for_dns_name=wait_for_dns_name,
+                )
+            )
+            host_metadatas.append((memory_gb, logical_cpu, interruption_probability))
+
+    public_dns_names = await asyncio.gather(*public_dns_name_tasks)
+
+    return [
+        EC2Host(public_dns_name, *host_metadata)
+        for public_dns_name, host_metadata in zip(public_dns_names, host_metadatas)
+    ]
+
+
 def _ensure_meadowgrid_agent_security_group(
     ec2_resource: Any, current_ip_for_ssh: str
 ) -> str:
@@ -229,66 +485,33 @@ def _ensure_meadowgrid_agent_security_group(
     return security_group.id
 
 
-async def _ensure_meadowgrid_security_groups(ec2_resource: Any) -> str:
+async def _ensure_meadowgrid_security_groups() -> str:
     """
     Creates the meadowgrid coordinator security group and meadowgrid agent security
     group if they doesn't exist. The coordinator security group allows meadowgrid agents
     and the current ip to access the coordinator, as well as allowing the current ip to
     ssh. See also _ensure_meadowgrid_agent_security_group.
     """
-    security_group = _get_ec2_security_group(
-        ec2_resource, _MEADOWGRID_COORDINATOR_SECURITY_GROUP
-    )
-    if security_group is None:
-        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.create_security_group
-        security_group = ec2_resource.create_security_group(
-            Description="security group for meadowgrid coordinator",
-            GroupName=_MEADOWGRID_COORDINATOR_SECURITY_GROUP,
-        )
 
     current_ip_for_ssh = await _get_current_ip_for_ssh()
 
     # allow meadowgrid traffic from the meadowgrid agent security group
-    agent_security_group_id = _ensure_meadowgrid_agent_security_group(
-        ec2_resource, current_ip_for_ssh
-    )
-    _ignore_boto3_error_code(
-        lambda: security_group.authorize_ingress(
-            IpPermissions=[
-                {
-                    "FromPort": DEFAULT_COORDINATOR_PORT,
-                    "ToPort": DEFAULT_COORDINATOR_PORT,
-                    "IpProtocol": "tcp",
-                    "UserIdGroupPairs": [{"GroupId": agent_security_group_id}],
-                }
-            ]
-        ),
-        "InvalidPermission.Duplicate",
+    agent_security_group_id = ensure_security_group(
+        _MEADOWGRID_AGENT_SECURITY_GROUP, [(22, 22, f"{current_ip_for_ssh}/32")], []
     )
 
-    # allow meadowgrid traffic from the current machine
-    # TODO this is a bit hacky, probably the user should be able to specify what IP
-    # addresses are able to interact with the coordinator. Also if we're allowing
-    # external traffic, then we should probably be encrypting all of the traffic.
-    _ignore_boto3_error_code(
-        lambda: security_group.authorize_ingress(
-            IpProtocol="tcp",
-            CidrIp=f"{current_ip_for_ssh}/32",
-            FromPort=DEFAULT_COORDINATOR_PORT,
-            ToPort=DEFAULT_COORDINATOR_PORT,
-        ),
-        "InvalidPermission.Duplicate",
+    return ensure_security_group(
+        _MEADOWGRID_COORDINATOR_SECURITY_GROUP,
+        [
+            (22, 22, f"{current_ip_for_ssh}/32"),
+            (
+                DEFAULT_COORDINATOR_PORT,
+                DEFAULT_COORDINATOR_PORT,
+                f"{current_ip_for_ssh}/32",
+            ),
+        ],
+        [(DEFAULT_COORDINATOR_PORT, DEFAULT_COORDINATOR_PORT, agent_security_group_id)],
     )
-
-    # allow SSH from the current machine TODO this should be configurable
-    _ignore_boto3_error_code(
-        lambda: security_group.authorize_ingress(
-            IpProtocol="tcp", CidrIp=f"{current_ip_for_ssh}/32", FromPort=22, ToPort=22
-        ),
-        "InvalidPermission.Duplicate",
-    )
-
-    return security_group.id
 
 
 async def launch_meadowgrid_coordinator(region_name: Optional[str] = None) -> str:
@@ -302,30 +525,23 @@ async def launch_meadowgrid_coordinator(region_name: Optional[str] = None) -> st
     if region_name is None:
         region_name = await _get_default_region_name()
 
-    ec2_resource = boto3.resource("ec2", region_name=region_name)
     _ensure_meadowgrid_coordinator_iam_role(region_name)
-    security_group_id = await _ensure_meadowgrid_security_groups(ec2_resource)
+    security_group_id = await _ensure_meadowgrid_security_groups()
 
     # Create the coordinator instance
     # TODO we've just hardcoded the instance type for the coordinator for now
-    # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.run_instances
-    instance = ec2_resource.create_instances(
-        ImageId=_COORDINATOR_AWS_AMI,
-        MinCount=1,
-        MaxCount=1,
-        InstanceType="t2.micro",
-        SecurityGroupIds=[security_group_id],
-        IamInstanceProfile={"Name": _MEADOWGRID_COORDINATOR_ROLE},
-    )[0]
-
-    # wait until it gets a public IP address
-    while not instance.public_ip_address:
-        # TODO add a (configurable) timeout
-        await asyncio.sleep(0.2)
-        instance.load()
+    coordinator_ip = await launch_ec2_instance(
+        region_name,
+        "t2.micro",
+        "on_demand",
+        _COORDINATOR_AWS_AMI,
+        security_group_id,
+        _MEADOWGRID_COORDINATOR_ROLE,
+    )
+    assert coordinator_ip is not None
 
     # now wait until check() returns True
-    coordinator_address = f"{instance.public_ip_address}:{DEFAULT_COORDINATOR_PORT}"
+    coordinator_address = f"{coordinator_ip}:{DEFAULT_COORDINATOR_PORT}"
 
     async with MeadowGridCoordinatorClientAsync(coordinator_address) as client:
         # TODO add a (configurable) timeout
@@ -338,7 +554,7 @@ async def launch_meadowgrid_coordinator(region_name: Optional[str] = None) -> st
                 # TODO there are probably some exceptions we shouldn't ignore
                 pass
 
-    return instance.public_ip_address
+    return coordinator_ip
 
 
 class AwsAgentCreator(AgentCreator):
@@ -483,30 +699,15 @@ echo AGENT_ID={agent_id} >> /meadowgrid/agent.conf
 echo JOB_ID={job_id} >> /meadowgrid/agent.conf
 """
 
-    if on_demand_or_spot == "on_demand":
-        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.run_instances
-        _ = ec2_resource.create_instances(
-            ImageId=_AGENT_AWS_AMI,
-            MinCount=1,
-            MaxCount=1,
-            InstanceType=instance_type,
-            SecurityGroupIds=[security_group.id],
-            UserData=user_data,
-        )[0]
-    elif on_demand_or_spot == "spot":
-        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.request_spot_instances
-        client = boto3.client("ec2", region_name=region_name)
-        _ = client.request_spot_instances(
-            InstanceCount=1,
-            LaunchSpecification={
-                "SecurityGroupIds": [security_group.id],
-                "ImageId": _AGENT_AWS_AMI,
-                "InstanceType": instance_type,
-                "UserData": base64.b64encode(user_data.encode("utf-8")).decode("utf-8"),
-            },
-        )
-    else:
-        raise ValueError(f"Unexpected value for on_demand_or_spot {on_demand_or_spot}")
+    await launch_ec2_instance(
+        region_name,
+        instance_type,
+        on_demand_or_spot,
+        _AGENT_AWS_AMI,
+        _MEADOWGRID_AGENT_SECURITY_GROUP,
+        user_data=user_data,
+        wait_for_dns_name=False,
+    )
 
 
 async def _get_ec2_instance_types(region_name: str) -> pd.DataFrame:

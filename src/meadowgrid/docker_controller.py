@@ -319,6 +319,7 @@ async def run_container(
     cmd: List[str],
     environment_variables: Dict[str, str],
     binds: List[Tuple[str, str]],
+    ports: List[str],
 ) -> aiodocker.containers.DockerContainer:
     """
     Runs a docker container. Examples of parameters:
@@ -341,6 +342,19 @@ async def run_container(
     # Now actually run the container. For documentation on the config object:
     # https://docs.docker.com/engine/api/v1.41/#operation/ContainerCreate
     client = await aiodocker.Docker().__aenter__()
+
+    # unfortunately PortBindings
+    expanded_ports = []
+    for port in ports:
+        if "-" in port:
+            split = port.split("-")
+            if len(split) != 2:
+                raise ValueError(f"Bad port specification {port}")
+            for i in range(int(split[0]), int(split[1]) + 1):
+                expanded_ports.append(str(i))
+        else:
+            expanded_ports.append(port)
+
     container = await client.containers.run(
         {
             "Image": image,
@@ -360,7 +374,11 @@ async def run_container(
                 # coordinator address. Also:
                 # https://stackoverflow.com/questions/31324981/how-to-access-host-port-from-docker-container/43541732#43541732
                 "ExtraHosts": ["host.docker.internal:host-gateway"],
+                "PortBindings": {
+                    f"{port}/tcp": [{"HostPort": port}] for port in expanded_ports
+                },
             },
+            "ExposedPorts": {f"{port}/tcp": {} for port in expanded_ports},
         }
     )
 

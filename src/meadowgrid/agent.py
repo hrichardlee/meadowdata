@@ -82,6 +82,8 @@ class _JobSpecTransformed:
     # This only gets used if we are running in a container. Specifies docker binds to
     # expose files on the host machine for input/output with the container.
     container_binds: List[Tuple[str, str]]
+    # Only gets used if we are running in a container
+    ports: List[str]
 
     environment_variables: Dict[str, str] = dataclasses.field(
         default_factory=lambda: {}
@@ -156,6 +158,7 @@ def _prepare_py_command(
         # we need a list, not a protobuf fake list
         list(job.py_command.command_line),
         _io_file_container_binds(io_folder, io_files),
+        list(job.ports),
         environment,
     )
 
@@ -267,6 +270,7 @@ def _prepare_py_function(
             itertools.chain(io_files, io_files_for_function, io_files_for_arguments),
         )
         + [(_FUNC_WORKER_PATH, func_worker_path)],
+        list(job.ports),
     )
 
 
@@ -331,6 +335,7 @@ def _prepare_py_grid(
             io_folder,
             itertools.chain(io_files, io_files_for_function, io_files_for_arguments),
         ),
+        list(job.ports),
     )
 
 
@@ -373,6 +378,7 @@ async def _launch_job(
         interpreter_deployment = job.WhichOneof("interpreter_deployment")
         is_container = interpreter_deployment in (
             "container_at_digest",
+            "container_at_tag",
             "server_available_container",
         )
 
@@ -442,6 +448,13 @@ async def _launch_job(
                 await pull_image(
                     container_image_name, interpreter_deployment_credentials
                 )
+            elif interpreter_deployment == "container_at_tag":
+                # warning this is not reproducible!!! should ideally be resolved on the
+                # client
+                container_image_name = f"{job.container_at_tag.repository}:{job.container_at_tag.tag}"  # noqa: E501
+                await pull_image(
+                    container_image_name, interpreter_deployment_credentials
+                )
             elif interpreter_deployment == "server_available_container":
                 container_image_name = job.server_available_container.image_name
                 # server_available_container assumes that we do not need to pull, and it
@@ -464,11 +477,6 @@ async def _launch_job(
             )
             # due to the way protobuf works, this is equivalent to None
             pid = 0
-        elif interpreter_deployment == "container_at_tag":
-            raise ValueError(
-                "Programming error, container_at_tag should have been resolved in the "
-                "coordinator"
-            )
         else:
             raise ValueError(
                 f"Did not recognize interpreter_deployment {interpreter_deployment}"
@@ -734,7 +742,8 @@ async def _launch_container_job(
         f"{' '.join(job_spec_transformed.command_line)}; "
         f"container image={container_image_name}; "
         f"PYTHONPATH={job_spec_transformed.environment_variables.get('PYTHONPATH')} "
-        f"log_file_name={log_file_name}"
+        f"log_file_name={log_file_name} "
+        f"ports={','.join(str(port) for port in job_spec_transformed.ports)}"
     )
 
     container = await run_container(
@@ -743,6 +752,7 @@ async def _launch_container_job(
         job_spec_transformed.command_line,
         job_spec_transformed.environment_variables,
         binds,
+        job_spec_transformed.ports,
     )
     return container.id, _container_job_continuation(
         container,
@@ -1140,7 +1150,7 @@ def _no_op() -> None:
 
 async def run_one_job(
     job_to_run: JobToRun, working_folder: Optional[str] = None
-) -> ProcessState:
+) -> Tuple[JobStateUpdate, Optional[asyncio.Task[JobStateUpdate]]]:
     """
     Runs one job using the specified working_folder (or uses the default). Returns a
     ProcessState when the job finishes.
@@ -1161,9 +1171,8 @@ async def run_one_job(
     ) = _unpickle_credentials(job_to_run)
 
     # run the job and return the results
-    job = job_to_run.job
-    first_state, continuation = await _launch_job(
-        job,
+    return await _launch_job(
+        job_to_run.job,
         job_to_run.grid_worker_id,
         io_folder,
         job_logs_folder,
@@ -1175,11 +1184,3 @@ async def run_one_job(
         code_deployment_credentials,
         interpreter_deployment_credentials,
     )
-
-    if (
-        first_state.process_state.state != ProcessStateEnum.RUNNING
-        or continuation is None
-    ):
-        return first_state.process_state
-
-    return (await continuation).process_state
