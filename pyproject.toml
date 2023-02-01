@@ -37,7 +37,7 @@ aiobotocore = "^2.1.2"
 types-aiobotocore = {extras = ["essential"], version = "^2.1.1"}
 
 [tool.poetry.dev-dependencies]
-pytest = "^7.0.1"
+pytest = "^7.2.1"
 mypy = "0.*"
 black = {version = "^22.1", allow-prereleases = true}
 grpcio-tools = "^1.39.0"
